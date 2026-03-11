@@ -1,0 +1,35 @@
+# ===== Build artifacts =====
+build/
+**/build/
+
+# ===== CMake / Ninja intermediate files =====
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# ===== ESP-IDF generated outputs =====
+*.elf
+*.map
+*.bin
+*.hex
+flasher_args.json
+flash_*_args
+partition-table*.bin
+sdkconfig.old
+
+# ===== Logs / debug generated files =====
+log/
+gdbinit/
+
+# ===== Python cache (idf.py related) =====
+__pycache__/
+*.py[cod]
+
+# ===== OS / IDE temp files =====
+.DS_Store
+Thumbs.db
+.vscode/

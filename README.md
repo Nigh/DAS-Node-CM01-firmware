@@ -1,0 +1,9 @@
+# DAS节点-电流采集-ESP32-Wifi
+
+## 硬件连接
+- ESP32-S3
+	- BATT_ADC: IO7 (锂电 100k/100k分压)
+	- SPI: CS(IO38) MISO(IO37) SCLK(IO36) MOSI(IO35)
+	- WS2812: IO48
+- ADS1118IDGS
+	- SPI
