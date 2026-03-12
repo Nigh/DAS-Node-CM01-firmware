@@ -12,6 +12,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 #include "nvs_flash.h"
 #include "esp_netif.h"
@@ -44,10 +45,23 @@
 #define HEARTBEAT_BROADCAST_MS    1000
 #define SAMPLE_PERIOD_MS          10
 #define CLIENT_TIMEOUT_MS         5000
+#define LOW_BATT_THRESHOLD_V      3.5f
+#define LED_BLINK_PERIOD_MS       1000
+#define LED_BLINK_ON_MS           500
+#define LED_TX_PULSE_MS           15
 
 #define WIFI_CONNECTED_BIT        BIT0
 
 #define DEVICE_NAME               "DAS_NODE_CM01"
+
+// 调试开关：1=不依赖真实ADC/ADS硬件，使用模拟数据
+#define ADC_SIM_MODE              1
+
+#define BATCH_SIZE                8
+#define ADC_CHANNEL_COUNT         3
+
+// ADS1118: PGA=±4.096V -> LSB=125uV
+#define ADS1118_LSB_V             0.000125f
 
 static const char *TAG = "DAS_NODE_CM01";
 
@@ -56,6 +70,24 @@ static spi_device_handle_t s_ads1118_dev;
 static led_strip_handle_t s_led_strip;
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_client_mutex;
+
+typedef enum {
+    ADC_CH_BATT = 0,
+    ADC_CH_ADS_DIFF,
+    ADC_CH_ADS_SUM,
+} adc_channel_id_t;
+
+typedef struct {
+    const char *channel;
+    int64_t ts_ms;
+    float current;
+    float max8;
+    float min8;
+} sample_record_t;
+
+typedef struct {
+    sample_record_t rec[ADC_CHANNEL_COUNT];
+} sample_frame_t;
 
 typedef struct {
     bool connected;
@@ -66,13 +98,23 @@ typedef struct {
 static client_state_t s_client_state = {0};
 static int s_udp_sock = -1;
 
+// 采样发送任务使用的静态缓存，避免大对象占用任务栈导致栈溢出
+static char s_tx_buf[3072];
+static sample_frame_t s_batch[BATCH_SIZE];
+static float s_hist[ADC_CHANNEL_COUNT][BATCH_SIZE];
+
 typedef enum {
     LED_STATE_WIFI_DOWN = 0,
     LED_STATE_WIFI_UP_NO_APP,
     LED_STATE_APP_CONNECTED,
+    LED_STATE_LOW_BATT,
 } led_state_t;
 
 static bool client_is_connected(void);
+static int64_t now_ms(void);
+
+static volatile bool s_low_power_mode = false;
+static volatile int64_t s_last_tx_flash_ms = 0;
 
 static void init_batt_adc(void)
 {
@@ -126,11 +168,78 @@ static uint16_t ads1118_transfer_word(uint16_t tx_word)
     return (uint16_t)((rx_data[0] << 8) | rx_data[1]);
 }
 
-static int16_t ads1118_read_raw(void)
+static uint16_t ads1118_build_config(uint8_t mux)
 {
-    // 写配置并读回上一拍转换结果：示例配置
-    uint16_t raw = ads1118_transfer_word(0x8583);
+    // OS=1(单次启动), MUX, PGA=001(±4.096V), MODE=1(单次), DR=110(475SPS), TS=0, PULLUP=1, NOP=01
+    return (uint16_t)((1u << 15) | ((uint16_t)(mux & 0x07u) << 12) | (1u << 9) | (1u << 8) |
+                      (6u << 5) | (1u << 3) | (1u));
+}
+
+static int16_t ads1118_read_single_shot_raw(uint8_t mux)
+{
+    uint16_t cfg = ads1118_build_config(mux);
+    (void)ads1118_transfer_word(cfg);   // 启动本次转换
+    esp_rom_delay_us(2500);             // 475SPS约2.1ms，留余量
+    uint16_t raw = ads1118_transfer_word(cfg); // 读回本次转换结果（并启动下一次）
     return (int16_t)raw;
+}
+
+static const char *channel_name(adc_channel_id_t ch)
+{
+    switch (ch) {
+    case ADC_CH_BATT: return "BATT_ADC";
+    case ADC_CH_ADS_DIFF: return "ADS_DIFF";
+    case ADC_CH_ADS_SUM: return "ADS_SUM";
+    default: return "UNKNOWN";
+    }
+}
+
+static void read_all_channels_values(float out_values[ADC_CHANNEL_COUNT])
+{
+#if ADC_SIM_MODE
+    static uint32_t t = 0;
+    t++;
+    // 简单平滑模拟：电池、电压差分、AIN2+AIN3
+    out_values[ADC_CH_BATT] = 22.0f + ((float)(t % 120) * 0.05f);     // 22.0 ~ 28.0V
+    out_values[ADC_CH_ADS_DIFF] = 0.6f + ((float)((t * 3) % 80) * 0.01f); // 0.6 ~ 1.4V
+    out_values[ADC_CH_ADS_SUM] = 1.0f + ((float)((t * 5) % 280) * 0.02f); // 1.0 ~ 6.6V
+#else
+    int batt_raw = 0;
+    if (adc_oneshot_read(s_adc_handle, BATT_ADC_CHANNEL, &batt_raw) == ESP_OK) {
+        float v_adc = (batt_raw / 4095.0f) * 3.3f;
+        out_values[ADC_CH_BATT] = v_adc * 2.0f;
+    } else {
+        out_values[ADC_CH_BATT] = 0.0f;
+    }
+
+    // MUX: 000=AIN0-AIN1, 110=AIN2-GND, 111=AIN3-GND
+    int16_t raw_diff = ads1118_read_single_shot_raw(0);
+    int16_t raw_ain2 = ads1118_read_single_shot_raw(6);
+    int16_t raw_ain3 = ads1118_read_single_shot_raw(7);
+
+    float v_diff = (float)raw_diff * ADS1118_LSB_V;
+    float v_ain2 = (float)raw_ain2 * ADS1118_LSB_V;
+    float v_ain3 = (float)raw_ain3 * ADS1118_LSB_V;
+
+    out_values[ADC_CH_ADS_DIFF] = v_diff;
+    out_values[ADC_CH_ADS_SUM] = v_ain2 + v_ain3;
+#endif
+}
+
+static void compute_window_stats(const float hist[ADC_CHANNEL_COUNT][BATCH_SIZE], int count,
+                                 float out_min[ADC_CHANNEL_COUNT], float out_max[ADC_CHANNEL_COUNT])
+{
+    for (int ch = 0; ch < ADC_CHANNEL_COUNT; ch++) {
+        float min_v = FLT_MAX;
+        float max_v = -FLT_MAX;
+        for (int i = 0; i < count; i++) {
+            float v = hist[ch][i];
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+        }
+        out_min[ch] = (count > 0) ? min_v : 0.0f;
+        out_max[ch] = (count > 0) ? max_v : 0.0f;
+    }
 }
 
 static void init_ws2812(void)
@@ -166,6 +275,9 @@ static bool wifi_is_connected(void)
 
 static led_state_t get_led_state(void)
 {
+    if (s_low_power_mode) {
+        return LED_STATE_LOW_BATT;
+    }
     if (!wifi_is_connected()) {
         return LED_STATE_WIFI_DOWN;
     }
@@ -178,32 +290,49 @@ static led_state_t get_led_state(void)
 static void task_status_led(void *arg)
 {
     (void)arg;
-    bool on = false;
 
     while (1) {
         led_state_t state = get_led_state();
-        on = !on;
+        int64_t now = now_ms();
+        bool blink_on = ((now % LED_BLINK_PERIOD_MS) < LED_BLINK_ON_MS);
 
         uint8_t r = 0, g = 0, b = 0;
-        if (on) {
-            switch (state) {
-            case LED_STATE_WIFI_DOWN:
-                r = 32; g = 0; b = 0;    // 红
-                break;
-            case LED_STATE_WIFI_UP_NO_APP:
-                r = 32; g = 16; b = 0;   // 黄
-                break;
-            case LED_STATE_APP_CONNECTED:
-                r = 0; g = 32; b = 0;    // 绿
-                break;
-            default:
-                break;
+        switch (state) {
+        case LED_STATE_WIFI_DOWN:
+            // WiFi 未连接：黄灯闪烁
+            if (blink_on) {
+                r = 32; g = 16; b = 0;
             }
+            break;
+        case LED_STATE_WIFI_UP_NO_APP:
+            // WiFi 已连接但未连接 APP：绿灯闪烁
+            if (blink_on) {
+                r = 0; g = 32; b = 0;
+            }
+            break;
+        case LED_STATE_APP_CONNECTED: {
+            // APP 已连接：绿灯常亮；UDP 发送时短脉冲闪烁（类似网口灯）
+            bool flash_active = (now - s_last_tx_flash_ms) <= LED_TX_PULSE_MS;
+            if (flash_active) {
+                r = 0; g = 0; b = 0;
+            } else {
+                r = 0; g = 32; b = 0;
+            }
+            break;
+        }
+        case LED_STATE_LOW_BATT:
+            // 低电压：红灯每秒短闪一次（80ms on + 920ms off）
+            if ((now % 1000) < 80) {
+                r = 32; g = 0; b = 0;
+            }
+            break;
+        default:
+            break;
         }
 
         ESP_ERROR_CHECK(led_strip_set_pixel(s_led_strip, 0, r, g, b));
         ESP_ERROR_CHECK(led_strip_refresh(s_led_strip));
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -301,6 +430,11 @@ static void task_net_rx(void *arg)
     char rx_buf[128];
 
     while (1) {
+        if (s_low_power_mode || s_udp_sock < 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         struct sockaddr_in src_addr = {0};
         socklen_t addr_len = sizeof(src_addr);
         int len = recvfrom(s_udp_sock, rx_buf, sizeof(rx_buf) - 1, 0,
@@ -317,6 +451,16 @@ static void task_net_rx(void *arg)
             }
             s_client_state.connected = true;
             xSemaphoreGive(s_client_mutex);
+        } else if (len == 0) {
+            // UDP上几乎不会出现0长度负载，忽略即可
+            continue;
+        } else {
+            int err = errno;
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                // recv超时，正常轮询
+                continue;
+            }
+            ESP_LOGW(TAG, "recvfrom failed, errno=%d", err);
         }
     }
 }
@@ -333,9 +477,17 @@ static void task_heartbeat(void *arg)
     };
 
     while (1) {
+        if (s_low_power_mode || s_udp_sock < 0) {
+            vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_BROADCAST_MS));
+            continue;
+        }
+
         if (!client_is_connected()) {
-            sendto(s_udp_sock, msg, strlen(msg), 0,
-                   (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+            int ret = sendto(s_udp_sock, msg, strlen(msg), 0,
+                             (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+            if (ret < 0) {
+                ESP_LOGW(TAG, "heartbeat send failed, errno=%d", errno);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_BROADCAST_MS));
     }
@@ -347,36 +499,156 @@ static void task_sampling_tx(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t seq = 0;
     uint32_t log_div = 0;
-    char tx_buf[256];
+    uint32_t stack_log_div = 0;
+    int batch_count = 0;
+    int hist_count = 0;
+    int hist_write_idx = 0;
+    bool cache_cleared_when_disconnected = false;
+
+    memset(s_batch, 0, sizeof(s_batch));
+    memset(s_hist, 0, sizeof(s_hist));
+    memset(s_tx_buf, 0, sizeof(s_tx_buf));
 
     while (1) {
-        if (client_is_connected()) {
-            int adc_raw = 0;
-            if (adc_oneshot_read(s_adc_handle, BATT_ADC_CHANNEL, &adc_raw) == ESP_OK) {
-                float v_adc = (adc_raw / 4095.0f) * 3.3f;
-                float v_batt = v_adc * 2.0f;
-                int16_t ads_raw = ads1118_read_raw();
+        float values[ADC_CHANNEL_COUNT] = {0};
+        int64_t ts_ms = now_ms();
+        read_all_channels_values(values);
 
-                int n = snprintf(tx_buf, sizeof(tx_buf),
-                                 "{\"type\":\"data\",\"seq\":%" PRIu32
-                                 ",\"uptime_ms\":%" PRIi64
-                                 ",\"batt_raw\":%d,\"batt_v\":%.3f,\"ads_raw\":%d}",
-                                 seq++, now_ms(), adc_raw, v_batt, ads_raw);
-                if (n > 0) {
-                    struct sockaddr_in dst = {0};
-                    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-                    dst = s_client_state.addr;
-                    xSemaphoreGive(s_client_mutex);
+        if (!ADC_SIM_MODE && !s_low_power_mode && values[ADC_CH_BATT] < LOW_BATT_THRESHOLD_V) {
+            s_low_power_mode = true;
+            ESP_LOGW(TAG, "LOW_BATT detected: %.3fV, entering low power mode", values[ADC_CH_BATT]);
 
-                    sendto(s_udp_sock, tx_buf, (size_t)n, 0,
-                           (struct sockaddr *)&dst, sizeof(dst));
-                }
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            esp_wifi_disconnect();
+            esp_wifi_stop();
 
-                if (++log_div >= 100) {
-                    log_div = 0;
-                    ESP_LOGI(TAG, "TX seq=%" PRIu32 " batt=%.3fV ads=%d", seq, v_batt, ads_raw);
+            if (s_udp_sock >= 0) {
+                shutdown(s_udp_sock, 0);
+                close(s_udp_sock);
+                s_udp_sock = -1;
+            }
+
+            xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+            memset(&s_client_state, 0, sizeof(s_client_state));
+            xSemaphoreGive(s_client_mutex);
+
+            memset(s_batch, 0, sizeof(s_batch));
+            memset(s_hist, 0, sizeof(s_hist));
+            batch_count = 0;
+            hist_count = 0;
+            hist_write_idx = 0;
+            seq = 0;
+            cache_cleared_when_disconnected = true;
+            ESP_LOGW(TAG, "WiFi stopped, UDP closed, TX cache cleared");
+        }
+
+        if (s_low_power_mode) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // 更新最近8点历史
+        for (int ch = 0; ch < ADC_CHANNEL_COUNT; ch++) {
+            s_hist[ch][hist_write_idx] = values[ch];
+        }
+        hist_write_idx = (hist_write_idx + 1) % BATCH_SIZE;
+        if (hist_count < BATCH_SIZE) {
+            hist_count++;
+        }
+
+        float min8[ADC_CHANNEL_COUNT] = {0};
+        float max8[ADC_CHANNEL_COUNT] = {0};
+        compute_window_stats(s_hist, hist_count, min8, max8);
+
+        bool connected = client_is_connected();
+        if (!connected && !cache_cleared_when_disconnected) {
+            memset(s_batch, 0, sizeof(s_batch));
+            memset(s_hist, 0, sizeof(s_hist));
+            batch_count = 0;
+            hist_count = 0;
+            hist_write_idx = 0;
+            seq = 0;
+            cache_cleared_when_disconnected = true;
+            ESP_LOGI(TAG, "Client disconnected, TX cache cleared, seq reset");
+        }
+        if (connected && cache_cleared_when_disconnected) {
+            cache_cleared_when_disconnected = false;
+            ESP_LOGI(TAG, "Client reconnected, resume TX with fresh samples");
+        }
+
+        // 存入本次3通道记录
+        for (int ch = 0; ch < ADC_CHANNEL_COUNT; ch++) {
+            s_batch[batch_count].rec[ch].channel = channel_name((adc_channel_id_t)ch);
+            s_batch[batch_count].rec[ch].ts_ms = ts_ms;
+            s_batch[batch_count].rec[ch].current = values[ch];
+            s_batch[batch_count].rec[ch].max8 = max8[ch];
+            s_batch[batch_count].rec[ch].min8 = min8[ch];
+        }
+        batch_count++;
+
+        if (batch_count >= BATCH_SIZE) {
+            if (connected) {
+                int off = snprintf(s_tx_buf, sizeof(s_tx_buf),
+                                   "{\"type\":\"data_batch\",\"seq\":%" PRIu32 ",\"records\":[",
+                                   seq++);
+                if (off > 0 && off < (int)sizeof(s_tx_buf)) {
+                    bool first = true;
+                    for (int i = 0; i < BATCH_SIZE; i++) {
+                        for (int ch = 0; ch < ADC_CHANNEL_COUNT; ch++) {
+                            sample_record_t *r = &s_batch[i].rec[ch];
+                            int n = snprintf(s_tx_buf + off, sizeof(s_tx_buf) - (size_t)off,
+                                             "%s{\"ch\":\"%s\",\"ts\":%" PRIi64
+                                             ",\"max8\":%.4f,\"cur\":%.4f,\"min8\":%.4f}",
+                                             first ? "" : ",", r->channel, r->ts_ms,
+                                             r->max8, r->current, r->min8);
+                            if (n <= 0 || (off + n) >= (int)sizeof(s_tx_buf)) {
+                                off = -1;
+                                break;
+                            }
+                            off += n;
+                            first = false;
+                        }
+                        if (off < 0) {
+                            break;
+                        }
+                    }
+                    if (off > 0 && (off + 3) < (int)sizeof(s_tx_buf)) {
+                        s_tx_buf[off++] = ']';
+                        s_tx_buf[off++] = '}';
+                        s_tx_buf[off] = '\0';
+
+                        struct sockaddr_in dst = {0};
+                        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+                        dst = s_client_state.addr;
+                        xSemaphoreGive(s_client_mutex);
+
+                        int ret = sendto(s_udp_sock, s_tx_buf, (size_t)off, 0,
+                                         (struct sockaddr *)&dst, sizeof(dst));
+                        if (ret < 0) {
+                            ESP_LOGW(TAG, "data batch send failed, errno=%d", errno);
+                        } else {
+                            s_last_tx_flash_ms = now_ms();
+                        }
+                    }
+
+                    if (++log_div >= 10) {
+                        log_div = 0;
+                        ESP_LOGI(TAG, "TX batch seq=%" PRIu32 " rec=24 batt=%.3f diff=%.3f sum=%.3f",
+                                 seq, values[ADC_CH_BATT], values[ADC_CH_ADS_DIFF], values[ADC_CH_ADS_SUM]);
+                    }
+
+                    if (++stack_log_div >= 50) {
+                        stack_log_div = 0;
+                        UBaseType_t wm_words = uxTaskGetStackHighWaterMark(NULL);
+                        size_t wm_bytes = ((size_t)wm_words) * sizeof(StackType_t);
+                        ESP_LOGI(TAG, "sampling_tx stack high water mark: %lu words (~%lu bytes)",
+                                 (unsigned long)wm_words,
+                                 (unsigned long)wm_bytes);
+                    }
                 }
             }
+
+            batch_count = 0;
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
@@ -398,8 +670,12 @@ void app_main(void)
     s_client_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK((s_wifi_event_group && s_client_mutex) ? ESP_OK : ESP_FAIL);
 
-    init_batt_adc();
-    init_ads1118_spi();
+    if (!ADC_SIM_MODE) {
+        init_batt_adc();
+        init_ads1118_spi();
+    } else {
+        ESP_LOGW(TAG, "ADC_SIM_MODE enabled: using simulated ADC data");
+    }
     init_ws2812();
     init_wifi_sta();
 
@@ -411,5 +687,5 @@ void app_main(void)
 
     xTaskCreate(task_net_rx, "net_rx", 4096, NULL, 6, NULL);
     xTaskCreate(task_heartbeat, "heartbeat", 3072, NULL, 4, NULL);
-    xTaskCreate(task_sampling_tx, "sampling_tx", 4096, NULL, 5, NULL);
+    xTaskCreate(task_sampling_tx, "sampling_tx", 12288, NULL, 5, NULL);
 }
