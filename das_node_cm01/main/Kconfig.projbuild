@@ -1,0 +1,15 @@
+menu "DAS Node CM01 Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        WiFi SSID used by STA mode.
+
+config WIFI_PASS
+    string "WiFi password"
+    default ""
+    help
+        WiFi password used by STA mode.
+
+endmenu

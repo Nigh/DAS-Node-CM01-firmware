@@ -20,6 +20,8 @@ flasher_args.json
 flash_*_args
 partition-table*.bin
 sdkconfig.old
+sdkconfig
+das_node_cm01/sdkconfig.secrets
 
 # ===== Logs / debug generated files =====
 log/
