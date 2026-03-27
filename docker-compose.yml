@@ -1,0 +1,31 @@
+services:
+  esp-idf:
+    image: espressif/idf:v5.5.3
+    container_name: esp32-idf-dev
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
+
+    # 让容器访问串口
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+
+    # 如有权限问题，可保留 group_add；如果仍有问题再看后文
+    group_add:
+      - "20"
+
+    volumes:
+      - ./das_node_cm01/:/workspace
+      - esp-idf-home:/root/.espressif
+      - vscode-extensions:/root/.vscode-server
+
+    environment:
+      IDF_PATH: /opt/esp/idf
+      TERM: xterm-256color
+
+    # 使用宿主网络，monitor/flash 更稳定，也方便你做一些网络调试
+    network_mode: host
+
+volumes:
+  esp-idf-home:
+  vscode-extensions:

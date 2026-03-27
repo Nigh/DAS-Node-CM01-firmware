@@ -1,0 +1,28 @@
+{
+  "name": "ESP-IDF v5.5.3",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "esp-idf",
+  "workspaceFolder": "/workspace",
+
+  "shutdownAction": "stopCompose",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "files.eol": "\n",
+        "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+      },
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-python.python",
+        "ms-vscode.makefile-tools"
+      ]
+    }
+  },
+
+  "remoteUser": "root",
+  "postCreateCommand": "bash -lc 'source /opt/esp/idf/export.sh && idf.py --version'",
+  "postStartCommand": "bash -lc 'source /opt/esp/idf/export.sh && idf.py --version'"
+}
