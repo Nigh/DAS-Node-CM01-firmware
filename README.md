@@ -1,5 +1,10 @@
 # DAS节点-电流采集-ESP32-Wifi
 
+
+
+> [!Note]
+> 配合 `DAS-Node-CM01` PCB 使用时，需要移除模块上的 3.3v LDO，需要连接模块上的 IN-OUT 短路点
+
 ## 硬件连接
 - ESP32-S3
 	- BATT_ADC: IO7 (锂电 100k/100k分压)
