@@ -25,6 +25,7 @@
 
 #include "esp_adc/adc_oneshot.h"
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "led_strip.h"
 
@@ -40,7 +41,7 @@
 
 #define WS2812_GPIO               48
 
-#define UDP_PORT                  9000
+#define UDP_PORT                  19000
 
 #define HEARTBEAT_BROADCAST_MS    1000
 #define SAMPLE_PERIOD_MS          10
@@ -55,13 +56,21 @@
 #define DEVICE_NAME               "DAS_NODE_CM01"
 
 // 调试开关：1=不依赖真实ADC/ADS硬件，使用模拟数据
-#define ADC_SIM_MODE              1
+#define ADC_SIM_MODE              0
 
 #define BATCH_SIZE                8
 #define ADC_CHANNEL_COUNT         3
 
 // ADS1118: PGA=±4.096V -> LSB=125uV
 #define ADS1118_LSB_V             0.000125f
+#define ADS_AIN1_REF_V            1.25f
+#define ADS_AIN0_DIV_RATIO        ((1000.0f + 39.0f) / 39.0f)
+#define ACS725_ZERO_V             (3.3f / 2.0f)
+#define ACS725_SENSITIVITY_V_PER_A 0.0264f
+#define CALIB_VOLTAGE_NEAR_ZERO_TH 0.3f
+#define CALIB_HOLD_MS             2000
+#define CALIB_STARTUP_WINDOW_MS   10000
+#define CALIB_MAX_SAMPLES         ((CALIB_HOLD_MS / SAMPLE_PERIOD_MS) + 8)
 
 static const char *TAG = "DAS_NODE_CM01";
 
@@ -73,8 +82,8 @@ static SemaphoreHandle_t s_client_mutex;
 
 typedef enum {
     ADC_CH_BATT = 0,
-    ADC_CH_ADS_DIFF,
-    ADC_CH_ADS_SUM,
+    ADC_CH_ADS_VOLTAGE,
+    ADC_CH_ADS_CURRENT,
 } adc_channel_id_t;
 
 typedef struct {
@@ -115,6 +124,56 @@ static int64_t now_ms(void);
 
 static volatile bool s_low_power_mode = false;
 static volatile int64_t s_last_tx_flash_ms = 0;
+static volatile float s_batt_voltage_cache = 0.0f;
+
+static volatile int16_t s_ads_raw_diff = 0;
+static volatile int16_t s_ads_raw_ain2 = 0;
+static volatile int16_t s_ads_raw_ain3 = 0;
+static volatile float s_ads_v_diff = 0.0f;
+static volatile float s_ads_v_ain2 = 0.0f;
+static volatile float s_ads_v_ain3 = 0.0f;
+static volatile float s_ads_voltage_uncal = 0.0f;
+static volatile float s_ads_current_uncal = 0.0f;
+
+static bool s_ads_last_mux_valid = false;
+static uint8_t s_ads_last_mux = 0xFF;
+static uint8_t s_ads_next_mux = 0;
+
+static float read_batt_voltage_once(void)
+{
+    int batt_raw = 0;
+    if (adc_oneshot_read(s_adc_handle, BATT_ADC_CHANNEL, &batt_raw) == ESP_OK) {
+        float v_adc = (batt_raw / 4095.0f) * 3.3f;
+        return v_adc * 2.226f;
+    }
+    return 0.0f;
+}
+
+static void enter_low_power_mode(float batt_v)
+{
+    if (s_low_power_mode) {
+        return;
+    }
+
+    s_low_power_mode = true;
+    ESP_LOGW(TAG, "LOW_BATT detected: %.3fV, entering low power mode", batt_v);
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+
+    if (s_udp_sock >= 0) {
+        shutdown(s_udp_sock, 0);
+        close(s_udp_sock);
+        s_udp_sock = -1;
+    }
+
+    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+    memset(&s_client_state, 0, sizeof(s_client_state));
+    xSemaphoreGive(s_client_mutex);
+
+    ESP_LOGW(TAG, "WiFi stopped, UDP closed, TX cache will be cleared in sampling task");
+}
 
 static void init_batt_adc(void)
 {
@@ -147,49 +206,123 @@ static void init_ads1118_spi(void)
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 1 * 1000 * 1000,
         .mode = 1,
-        .spics_io_num = SPI_PIN_CS,
+        .spics_io_num = -1,
         .queue_size = 4,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI_HOST_USED, &devcfg, &s_ads1118_dev));
+
+    gpio_config_t cs_io_conf = {
+        .pin_bit_mask = 1ULL << SPI_PIN_CS,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cs_io_conf));
+
+    // 测试模式：CS 持续保持拉低
+    ESP_ERROR_CHECK(gpio_set_level(SPI_PIN_CS, 0));
 }
 
-static uint16_t ads1118_transfer_word(uint16_t tx_word)
+static void ads1118_transfer_word(uint16_t tx_word, uint16_t *rx_prev_raw, uint16_t *rx_cfg_echo)
 {
-    uint8_t tx_data[2] = {(uint8_t)(tx_word >> 8), (uint8_t)(tx_word & 0xFF)};
-    uint8_t rx_data[2] = {0};
+    uint8_t tx_data[4] = {
+        (uint8_t)(tx_word >> 8),
+        (uint8_t)(tx_word & 0xFF),
+        0x00,
+        0x00,
+    };
+    uint8_t rx_data[4] = {0};
 
     spi_transaction_t t = {
-        .length = 16,
+        .length = 32,
         .tx_buffer = tx_data,
         .rx_buffer = rx_data,
     };
     ESP_ERROR_CHECK(spi_device_transmit(s_ads1118_dev, &t));
 
-    return (uint16_t)((rx_data[0] << 8) | rx_data[1]);
+    if (rx_prev_raw) {
+        *rx_prev_raw = (uint16_t)((rx_data[0] << 8) | rx_data[1]);
+    }
+    if (rx_cfg_echo) {
+        *rx_cfg_echo = (uint16_t)((rx_data[2] << 8) | rx_data[3]);
+    }
 }
 
 static uint16_t ads1118_build_config(uint8_t mux)
 {
-    // OS=1(单次启动), MUX, PGA=001(±4.096V), MODE=1(单次), DR=110(475SPS), TS=0, PULLUP=1, NOP=01
-    return (uint16_t)((1u << 15) | ((uint16_t)(mux & 0x07u) << 12) | (1u << 9) | (1u << 8) |
-                      (6u << 5) | (1u << 3) | (1u));
+    enum {
+        ADS1118_CFG_OS_SINGLE        = 1u << 15,
+        ADS1118_CFG_PGA_4V096        = 1u << 9,
+        ADS1118_CFG_MODE_SINGLE_SHOT = 1u << 8,
+        ADS1118_CFG_DR_475SPS        = 6u << 5,
+        ADS1118_CFG_TS_MODE_ADC      = 0u << 4,
+        ADS1118_CFG_PULLUP_EN        = 1u << 3,
+        ADS1118_CFG_NOP_VALID        = 1u << 1,
+        ADS1118_CFG_RESERVED         = 1u,
+    };
+
+    return (uint16_t)(ADS1118_CFG_OS_SINGLE |
+                      ((uint16_t)(mux & 0x07u) << 12) |
+                      ADS1118_CFG_PGA_4V096 |
+                      ADS1118_CFG_MODE_SINGLE_SHOT |
+                      ADS1118_CFG_DR_475SPS |
+                      ADS1118_CFG_TS_MODE_ADC |
+                      ADS1118_CFG_PULLUP_EN |
+                      ADS1118_CFG_NOP_VALID |
+                      ADS1118_CFG_RESERVED);
 }
 
-static int16_t ads1118_read_single_shot_raw(uint8_t mux)
+static void ads1118_sample_step(void)
 {
+    uint16_t prev_raw = 0;
+    uint16_t cfg_echo = 0;
+    uint8_t mux = s_ads_next_mux;
     uint16_t cfg = ads1118_build_config(mux);
-    (void)ads1118_transfer_word(cfg);   // 启动本次转换
-    esp_rom_delay_us(2500);             // 475SPS约2.1ms，留余量
-    uint16_t raw = ads1118_transfer_word(cfg); // 读回本次转换结果（并启动下一次）
-    return (int16_t)raw;
+
+    ads1118_transfer_word(cfg, &prev_raw, &cfg_echo);
+
+    if (s_ads_last_mux_valid) {
+        switch (s_ads_last_mux) {
+        case 0:
+            s_ads_raw_diff = (int16_t)prev_raw;
+            break;
+        case 6:
+            s_ads_raw_ain2 = (int16_t)prev_raw;
+            break;
+        case 7:
+            s_ads_raw_ain3 = (int16_t)prev_raw;
+            break;
+        default:
+            break;
+        }
+    }
+
+    s_ads_last_mux = mux;
+    s_ads_last_mux_valid = true;
+
+    switch (mux) {
+    case 0:
+        s_ads_next_mux = 6;
+        break;
+    case 6:
+        s_ads_next_mux = 7;
+        break;
+    case 7:
+    default:
+        s_ads_next_mux = 0;
+        break;
+    }
+
+    (void)cfg_echo;
 }
 
 static const char *channel_name(adc_channel_id_t ch)
 {
     switch (ch) {
     case ADC_CH_BATT: return "BATT_ADC";
-    case ADC_CH_ADS_DIFF: return "ADS_DIFF";
-    case ADC_CH_ADS_SUM: return "ADS_SUM";
+    case ADC_CH_ADS_VOLTAGE: return "ADS_VOLTAGE";
+    case ADC_CH_ADS_CURRENT: return "ADS_CURRENT";
     default: return "UNKNOWN";
     }
 }
@@ -199,30 +332,49 @@ static void read_all_channels_values(float out_values[ADC_CHANNEL_COUNT])
 #if ADC_SIM_MODE
     static uint32_t t = 0;
     t++;
-    // 简单平滑模拟：电池、电压差分、AIN2+AIN3
+    // 简单平滑模拟：电池、电压通道、电流通道
     out_values[ADC_CH_BATT] = 22.0f + ((float)(t % 120) * 0.05f);     // 22.0 ~ 28.0V
-    out_values[ADC_CH_ADS_DIFF] = 0.6f + ((float)((t * 3) % 80) * 0.01f); // 0.6 ~ 1.4V
-    out_values[ADC_CH_ADS_SUM] = 1.0f + ((float)((t * 5) % 280) * 0.02f); // 1.0 ~ 6.6V
-#else
-    int batt_raw = 0;
-    if (adc_oneshot_read(s_adc_handle, BATT_ADC_CHANNEL, &batt_raw) == ESP_OK) {
-        float v_adc = (batt_raw / 4095.0f) * 3.3f;
-        out_values[ADC_CH_BATT] = v_adc * 2.0f;
-    } else {
-        out_values[ADC_CH_BATT] = 0.0f;
-    }
+    out_values[ADC_CH_ADS_VOLTAGE] = 16.0f + ((float)((t * 3) % 200) * 0.1f); // 16.0 ~ 36.0V
+    out_values[ADC_CH_ADS_CURRENT] = -40.0f + ((float)((t * 5) % 800) * 0.1f); // -40.0 ~ 40.0A
 
-    // MUX: 000=AIN0-AIN1, 110=AIN2-GND, 111=AIN3-GND
-    int16_t raw_diff = ads1118_read_single_shot_raw(0);
-    int16_t raw_ain2 = ads1118_read_single_shot_raw(6);
-    int16_t raw_ain3 = ads1118_read_single_shot_raw(7);
+    s_ads_raw_diff = 0;
+    s_ads_raw_ain2 = 0;
+    s_ads_raw_ain3 = 0;
+    s_ads_v_diff = 0.0f;
+    s_ads_v_ain2 = 0.0f;
+    s_ads_v_ain3 = 0.0f;
+    s_ads_voltage_uncal = out_values[ADC_CH_ADS_VOLTAGE];
+    s_ads_current_uncal = out_values[ADC_CH_ADS_CURRENT];
+#else
+    out_values[ADC_CH_BATT] = s_batt_voltage_cache;
+
+    ads1118_sample_step();
+
+    int16_t raw_diff = s_ads_raw_diff;
+    int16_t raw_ain2 = s_ads_raw_ain2;
+    int16_t raw_ain3 = s_ads_raw_ain3;
 
     float v_diff = (float)raw_diff * ADS1118_LSB_V;
     float v_ain2 = (float)raw_ain2 * ADS1118_LSB_V;
     float v_ain3 = (float)raw_ain3 * ADS1118_LSB_V;
+    float v_ain0 = v_diff + ADS_AIN1_REF_V;
+    float voltage = v_ain0 * ADS_AIN0_DIV_RATIO;
 
-    out_values[ADC_CH_ADS_DIFF] = v_diff;
-    out_values[ADC_CH_ADS_SUM] = v_ain2 + v_ain3;
+    float i_ain2 = (v_ain2 - ACS725_ZERO_V) / ACS725_SENSITIVITY_V_PER_A;
+    float i_ain3 = (v_ain3 - ACS725_ZERO_V) / ACS725_SENSITIVITY_V_PER_A;
+    float current = i_ain2 + i_ain3;
+
+    s_ads_raw_diff = raw_diff;
+    s_ads_raw_ain2 = raw_ain2;
+    s_ads_raw_ain3 = raw_ain3;
+    s_ads_v_diff = v_diff;
+    s_ads_v_ain2 = v_ain2;
+    s_ads_v_ain3 = v_ain3;
+    s_ads_voltage_uncal = voltage;
+    s_ads_current_uncal = current;
+
+    out_values[ADC_CH_ADS_VOLTAGE] = voltage;
+    out_values[ADC_CH_ADS_CURRENT] = current;
 #endif
 }
 
@@ -240,6 +392,39 @@ static void compute_window_stats(const float hist[ADC_CHANNEL_COUNT][BATCH_SIZE]
         out_min[ch] = (count > 0) ? min_v : 0.0f;
         out_max[ch] = (count > 0) ? max_v : 0.0f;
     }
+}
+
+static void sort_float_array(float *arr, int count)
+{
+    for (int i = 1; i < count; i++) {
+        float key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+static float compute_median(const float *values, int count)
+{
+    if (count <= 0) {
+        return 0.0f;
+    }
+
+    float sorted[CALIB_MAX_SAMPLES];
+    int capped_count = (count > CALIB_MAX_SAMPLES) ? CALIB_MAX_SAMPLES : count;
+    memcpy(sorted, values, (size_t)capped_count * sizeof(float));
+    sort_float_array(sorted, capped_count);
+
+    if ((capped_count & 1) != 0) {
+        return sorted[capped_count / 2];
+    }
+
+    int upper = capped_count / 2;
+    int lower = upper - 1;
+    return (sorted[lower] + sorted[upper]) * 0.5f;
 }
 
 static void init_ws2812(void)
@@ -504,34 +689,108 @@ static void task_sampling_tx(void *arg)
     int hist_count = 0;
     int hist_write_idx = 0;
     bool cache_cleared_when_disconnected = false;
+    int64_t last_batt_sample_ms = 0;
+    int64_t boot_ms = now_ms();
+    int64_t last_ads_diag_log_ms = 0;
+    bool calib_done = false;
+    bool calib_decided = false;
+    bool calib_hold_active = false;
+    int64_t calib_hold_start_ms = 0;
+    float calib_samples_v[CALIB_MAX_SAMPLES] = {0};
+    float calib_samples_i[CALIB_MAX_SAMPLES] = {0};
+    int calib_count = 0;
+    float voltage_offset = 0.0f;
+    float current_offset = 0.0f;
 
     memset(s_batch, 0, sizeof(s_batch));
     memset(s_hist, 0, sizeof(s_hist));
     memset(s_tx_buf, 0, sizeof(s_tx_buf));
 
+#if !ADC_SIM_MODE
+    s_batt_voltage_cache = read_batt_voltage_once();
+    last_batt_sample_ms = now_ms();
+    ESP_LOGI(TAG, "BATT 1Hz: %.3fV", s_batt_voltage_cache);
+    if (s_batt_voltage_cache < LOW_BATT_THRESHOLD_V) {
+        enter_low_power_mode(s_batt_voltage_cache);
+    }
+#endif
+
     while (1) {
         float values[ADC_CHANNEL_COUNT] = {0};
         int64_t ts_ms = now_ms();
+
+#if !ADC_SIM_MODE
+        if ((ts_ms - last_batt_sample_ms) >= 1000) {
+            s_batt_voltage_cache = read_batt_voltage_once();
+            last_batt_sample_ms = ts_ms;
+            ESP_LOGI(TAG, "BATT 1Hz: %.3fV", s_batt_voltage_cache);
+
+            // 非 SIM 模式下，与连接状态无关：只要低电就进入低电状态
+            if (s_batt_voltage_cache < LOW_BATT_THRESHOLD_V) {
+                enter_low_power_mode(s_batt_voltage_cache);
+            }
+        }
+#endif
+
         read_all_channels_values(values);
 
-        if (!ADC_SIM_MODE && !s_low_power_mode && values[ADC_CH_BATT] < LOW_BATT_THRESHOLD_V) {
-            s_low_power_mode = true;
-            ESP_LOGW(TAG, "LOW_BATT detected: %.3fV, entering low power mode", values[ADC_CH_BATT]);
+        if (!calib_decided) {
+            int64_t startup_elapsed = ts_ms - boot_ms;
+            float v_uncal = s_ads_voltage_uncal;
+            float i_uncal = s_ads_current_uncal;
 
-            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-            esp_wifi_disconnect();
-            esp_wifi_stop();
+            if (startup_elapsed <= CALIB_STARTUP_WINDOW_MS) {
+                bool near_zero = (v_uncal > -CALIB_VOLTAGE_NEAR_ZERO_TH) && (v_uncal < CALIB_VOLTAGE_NEAR_ZERO_TH);
+                if (near_zero) {
+                    if (!calib_hold_active) {
+                        calib_hold_active = true;
+                        calib_hold_start_ms = ts_ms;
+                        calib_count = 0;
+                    }
 
-            if (s_udp_sock >= 0) {
-                shutdown(s_udp_sock, 0);
-                close(s_udp_sock);
-                s_udp_sock = -1;
+                    if (calib_count < CALIB_MAX_SAMPLES) {
+                        calib_samples_v[calib_count] = v_uncal;
+                        calib_samples_i[calib_count] = i_uncal;
+                        calib_count++;
+                    }
+
+                    if ((ts_ms - calib_hold_start_ms) >= CALIB_HOLD_MS && calib_count > 0) {
+                        voltage_offset = compute_median(calib_samples_v, calib_count);
+                        current_offset = compute_median(calib_samples_i, calib_count);
+                        calib_done = true;
+                        calib_decided = true;
+                        ESP_LOGI(TAG, "Startup calibration done (median): v_off=%.5f, i_off=%.5f, samples=%d",
+                                 voltage_offset, current_offset, calib_count);
+                    }
+                } else {
+                    calib_hold_active = false;
+                    calib_count = 0;
+                }
+            } else {
+                calib_decided = true;
+                ESP_LOGW(TAG, "Startup calibration skipped: no continuous |V|<%.3fV for %dms within %dms window",
+                         CALIB_VOLTAGE_NEAR_ZERO_TH, CALIB_HOLD_MS, CALIB_STARTUP_WINDOW_MS);
             }
+        }
 
-            xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-            memset(&s_client_state, 0, sizeof(s_client_state));
-            xSemaphoreGive(s_client_mutex);
+        if (calib_done) {
+            values[ADC_CH_ADS_VOLTAGE] -= voltage_offset;
+            values[ADC_CH_ADS_CURRENT] -= current_offset;
+        }
 
+        if ((ts_ms - last_ads_diag_log_ms) >= 1000) {
+            last_ads_diag_log_ms = ts_ms;
+            ESP_LOGI(TAG,
+                     "ADS diag raw: diff=0x%04X(%d) ain2=0x%04X(%d) ain3=0x%04X(%d), vdiff=%.5f vain2=%.5f vain3=%.5f, out_v=%.5f out_i=%.5f, calib=%s",
+                     (uint16_t)s_ads_raw_diff, (int)s_ads_raw_diff,
+                     (uint16_t)s_ads_raw_ain2, (int)s_ads_raw_ain2,
+                     (uint16_t)s_ads_raw_ain3, (int)s_ads_raw_ain3,
+                     s_ads_v_diff, s_ads_v_ain2, s_ads_v_ain3,
+                     values[ADC_CH_ADS_VOLTAGE], values[ADC_CH_ADS_CURRENT],
+                     calib_done ? "ON" : "OFF");
+        }
+
+        if (s_low_power_mode) {
             memset(s_batch, 0, sizeof(s_batch));
             memset(s_hist, 0, sizeof(s_hist));
             batch_count = 0;
@@ -539,10 +798,6 @@ static void task_sampling_tx(void *arg)
             hist_write_idx = 0;
             seq = 0;
             cache_cleared_when_disconnected = true;
-            ESP_LOGW(TAG, "WiFi stopped, UDP closed, TX cache cleared");
-        }
-
-        if (s_low_power_mode) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -633,8 +888,8 @@ static void task_sampling_tx(void *arg)
 
                     if (++log_div >= 10) {
                         log_div = 0;
-                        ESP_LOGI(TAG, "TX batch seq=%" PRIu32 " rec=24 batt=%.3f diff=%.3f sum=%.3f",
-                                 seq, values[ADC_CH_BATT], values[ADC_CH_ADS_DIFF], values[ADC_CH_ADS_SUM]);
+                        ESP_LOGI(TAG, "TX batch seq=%" PRIu32 " rec=24 batt=%.3f voltage=%.3f current=%.3f",
+                                 seq, values[ADC_CH_BATT], values[ADC_CH_ADS_VOLTAGE], values[ADC_CH_ADS_CURRENT]);
                     }
 
                     if (++stack_log_div >= 50) {
@@ -658,6 +913,7 @@ static void task_sampling_tx(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Boot: ADC(GPIO7), SPI(CS38/MISO37/SCLK36/MOSI35), WS2812(GPIO48), UDP=%d", UDP_PORT);
+    ESP_LOGI(TAG, "WiFi config: ssid=%s, pass=%s", CONFIG_WIFI_SSID, CONFIG_WIFI_PASS);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
