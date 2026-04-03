@@ -9,7 +9,10 @@ services:
     # 让容器访问串口
     devices:
       - "/dev/ttyACM0:/dev/ttyACM0"
-
+    device_cgroup_rules:
+      - 'c 188:* rmw'
+      - 'c 166:* rmw'
+      - 'c 189:* rmw'
     # 如有权限问题，可保留 group_add；如果仍有问题再看后文
     group_add:
       - "20"

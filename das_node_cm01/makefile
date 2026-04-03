@@ -37,4 +37,4 @@ scan:
 	nc -ulvn -q 0 19000 < /dev/null
 
 send:
-	echo -n "hello" | nc -u -w1 192.168.50.122 19000
+	echo -n '{"type":"heartbeat"}' | nc -u -w1 192.168.50.122 19001

@@ -23,6 +23,4 @@
   },
 
   "remoteUser": "root",
-  "postCreateCommand": "bash -lc 'source /opt/esp/idf/export.sh && idf.py --version'",
-  "postStartCommand": "bash -lc 'source /opt/esp/idf/export.sh && idf.py --version'"
 }

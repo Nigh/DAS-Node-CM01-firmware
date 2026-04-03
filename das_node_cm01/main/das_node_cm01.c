@@ -23,6 +23,8 @@
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
 
+#include "cJSON.h"
+
 #include "esp_adc/adc_oneshot.h"
 
 #include "driver/gpio.h"
@@ -41,7 +43,8 @@
 
 #define WS2812_GPIO               48
 
-#define UDP_PORT                  19000
+#define UDP_TX_PORT               19000
+#define UDP_RX_PORT               19001
 
 #define HEARTBEAT_BROADCAST_MS    1000
 #define SAMPLE_PERIOD_MS          10
@@ -121,6 +124,7 @@ typedef enum {
 
 static bool client_is_connected(void);
 static int64_t now_ms(void);
+static bool is_valid_heartbeat_json(const char *payload);
 
 static volatile bool s_low_power_mode = false;
 static volatile int64_t s_last_tx_flash_ms = 0;
@@ -580,7 +584,7 @@ static void init_udp_socket(void)
 
     struct sockaddr_in local_addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(UDP_PORT),
+        .sin_port = htons(UDP_RX_PORT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
     ESP_ERROR_CHECK(bind(s_udp_sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0 ? ESP_FAIL : ESP_OK);
@@ -609,6 +613,25 @@ static bool client_is_connected(void)
     return connected;
 }
 
+static bool is_valid_heartbeat_json(const char *payload)
+{
+    if (payload == NULL) {
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(payload);
+    if (root == NULL) {
+        return false;
+    }
+
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    bool valid = cJSON_IsString(type) && (type->valuestring != NULL) &&
+                 (strcmp(type->valuestring, "heartbeat") == 0);
+
+    cJSON_Delete(root);
+    return valid;
+}
+
 static void task_net_rx(void *arg)
 {
     (void)arg;
@@ -626,6 +649,10 @@ static void task_net_rx(void *arg)
                            (struct sockaddr *)&src_addr, &addr_len);
         if (len > 0) {
             rx_buf[len] = '\0';
+            if (!is_valid_heartbeat_json(rx_buf)) {
+                continue;
+            }
+
             char ip_str[16] = {0};
             inet_ntoa_r(src_addr.sin_addr, ip_str, sizeof(ip_str));
             xSemaphoreTake(s_client_mutex, portMAX_DELAY);
@@ -657,7 +684,7 @@ static void task_heartbeat(void *arg)
 
     struct sockaddr_in bcast_addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(UDP_PORT),
+        .sin_port = htons(UDP_TX_PORT),
         .sin_addr.s_addr = htonl(INADDR_BROADCAST),
     };
 
@@ -912,7 +939,8 @@ static void task_sampling_tx(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Boot: ADC(GPIO7), SPI(CS38/MISO37/SCLK36/MOSI35), WS2812(GPIO48), UDP=%d", UDP_PORT);
+    ESP_LOGI(TAG, "Boot: ADC(GPIO7), SPI(CS38/MISO37/SCLK36/MOSI35), WS2812(GPIO48), UDP tx=%d rx=%d",
+             UDP_TX_PORT, UDP_RX_PORT);
     ESP_LOGI(TAG, "WiFi config: ssid=%s, pass=%s", CONFIG_WIFI_SSID, CONFIG_WIFI_PASS);
 
     esp_err_t ret = nvs_flash_init();
