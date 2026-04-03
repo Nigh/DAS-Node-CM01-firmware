@@ -1,6 +1,6 @@
 .PHONY: default build flash monitor scan send ensure_wifi_config reconfigure clean fullclean
 
-PORT ?= /dev/ttyACM0
+PORT ?= ttyACM0
 
 SDKCONFIG_DEFAULTS_FALLBACK := $(if $(wildcard sdkconfig.defaults),sdkconfig.defaults;sdkconfig.secrets,sdkconfig.secrets)
 SDKCONFIG_DEFAULTS ?= $(SDKCONFIG_DEFAULTS_FALLBACK)
@@ -21,10 +21,10 @@ reconfigure:
 	idf.py reconfigure
 
 flash:
-	idf.py -p $(PORT) flash
+	idf.py -p /dev/$(PORT) flash
 
 monitor:
-	idf.py -p $(PORT) monitor
+	idf.py -p /dev/$(PORT) monitor
 
 clean:
 	idf.py clean

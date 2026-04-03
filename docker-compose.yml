@@ -6,21 +6,18 @@ services:
     tty: true
     stdin_open: true
 
-    # 让容器访问串口
-    devices:
-      - "/dev/ttyACM0:/dev/ttyACM0"
+    volumes:
+      - /dev:/dev
+      - ./das_node_cm01/:/workspace
+      - esp-idf-home:/root/.espressif
+      - vscode-extensions:/root/.vscode-server
+
     device_cgroup_rules:
       - 'c 188:* rmw'
       - 'c 166:* rmw'
       - 'c 189:* rmw'
-    # 如有权限问题，可保留 group_add；如果仍有问题再看后文
     group_add:
       - "20"
-
-    volumes:
-      - ./das_node_cm01/:/workspace
-      - esp-idf-home:/root/.espressif
-      - vscode-extensions:/root/.vscode-server
 
     environment:
       IDF_PATH: /opt/esp/idf
